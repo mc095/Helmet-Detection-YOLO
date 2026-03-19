@@ -13,3 +13,5 @@ pytesseract>=0.3.10
 super-image>=0.1.7
 huggingface-hub>=0.20.0
 openpyxl==3.1.5 
+paddleocr>=2.7.0
+requests>=2.31.0

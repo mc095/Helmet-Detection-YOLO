@@ -22,38 +22,44 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=DM+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
 * { font-family: 'DM Sans', sans-serif !important; }
+
 .sc { display:flex; gap:12px; margin:12px 0 20px; }
-.sc-item { flex:1; padding:20px 12px; border-radius:10px; text-align:center;
+.sc-item { flex:1; padding:18px 12px; border-radius:10px; text-align:center;
     border:1px solid #e2e8f0; background:#fff; }
-.sc-num { font-size:2.2rem; font-weight:700;
+.sc-num { font-size:2rem; font-weight:700;
     font-family:'DM Mono',monospace !important; line-height:1; }
 .sc-lbl { font-size:0.65rem; font-weight:600; text-transform:uppercase;
     letter-spacing:0.1em; color:#94a3b8; margin-top:6px; }
 .sc-blue  .sc-num { color:#1d4ed8; }
 .sc-green .sc-num { color:#16a34a; }
 .sc-red   .sc-num { color:#dc2626; }
+
 .plate-ok { background:#fefce8; border:2px solid #ca8a04; border-radius:8px;
     padding:14px 20px; font-family:'DM Mono',monospace !important; font-size:1.5rem;
     font-weight:600; color:#713f12; text-align:center; letter-spacing:0.2em; margin:8px 0; }
 .plate-na { background:#f8fafc; border:1.5px dashed #cbd5e1; border-radius:8px;
     padding:12px 20px; font-size:0.85rem; color:#94a3b8; text-align:center; margin:8px 0; }
+
 .vtag { display:inline-flex; align-items:center; gap:6px; background:#fef2f2;
     border:1px solid #fca5a5; color:#b91c1c; border-radius:20px;
     padding:4px 14px; font-size:0.78rem; font-weight:600; margin:3px; }
+
 .sec-label { font-size:0.65rem; font-weight:700; letter-spacing:0.12em;
     text-transform:uppercase; color:#94a3b8; margin:16px 0 6px; }
+
 .empty-state { border:2px dashed #e2e8f0; border-radius:12px; padding:64px 20px;
     text-align:center; background:#fafbfc; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Model paths ───────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 MODEL_DIR         = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 HELMET_MODEL_PATH = MODEL_DIR / "helmet_best.pt"
 PLATE_MODEL_PATH  = MODEL_DIR / "plate_best.pt"
+GEMINI_API_KEY    = ""
 
 
 # ── Load models ───────────────────────────────────────────────────────────────
@@ -61,25 +67,21 @@ PLATE_MODEL_PATH  = MODEL_DIR / "plate_best.pt"
 def load_models():
     from ultralytics import YOLO
     from fast_alpr import ALPR
-    from fast_plate_ocr import LicensePlateRecognizer
-    import easyocr
     if not HELMET_MODEL_PATH.exists():
         return None
     m = {}
-    m['helmet']    = YOLO(str(HELMET_MODEL_PATH))
-    m['plate']     = YOLO(str(PLATE_MODEL_PATH)) if PLATE_MODEL_PATH.exists() else None
-    m['person']    = YOLO('yolov8m.pt')
-    m['alpr']      = ALPR(
+    m['helmet'] = YOLO(str(HELMET_MODEL_PATH))
+    m['plate']  = YOLO(str(PLATE_MODEL_PATH)) if PLATE_MODEL_PATH.exists() else None
+    m['person'] = YOLO('yolov8m.pt')
+    m['alpr']   = ALPR(
         detector_model='yolo-v9-t-384-license-plate-end2end',
         ocr_model='cct-s-v2-global-model',
         detector_conf_thresh=0.10,
     )
-    m['plate_ocr'] = LicensePlateRecognizer('cct-s-v2-global-model')
-    m['easyocr']   = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
     return m
 
 
-# ── Detection helpers ─────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def classify(label, idx):
     l = label.lower().replace(' ', '_')
     if any(k in l for k in ['without', 'no_helmet', 'nohelmet']): return 'no_helmet'
@@ -100,179 +102,143 @@ def draw_circle(f, x1, y1, x2, y2, tag, color):
     (tw,th),_=cv2.getTextSize(tag,cv2.FONT_HERSHEY_SIMPLEX,0.6,2)
     cv2.putText(f,tag,(cx-tw//2,cy-r-6),cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
 
-def super_resolve(crop):
+
+# ── OCR  ────────────────────────────────────────────────────────────
+def gemini_ocr(img):
+    """Send image to Gemini, get plate number back."""
+    import requests
+    _, buf = cv2.imencode('.jpg', img)
+    b64    = base64.b64encode(buf).decode('utf-8')
     try:
-        from super_image import EdsrModel, ImageLoader
-        if not hasattr(super_resolve,'_m'):
-            super_resolve._m = EdsrModel.from_pretrained('eugenesiow/edsr-base', scale=4)
-            super_resolve._m.eval()
-        pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-        with torch.no_grad(): out = super_resolve._m(ImageLoader.load_image(pil))
-        return cv2.cvtColor(np.array(ImageLoader.save_image(out)), cv2.COLOR_RGB2BGR)
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+            json={"contents": [{"parts": [
+                {"text": ("Find and read the vehicle number plate in this image. "
+                          "Return ONLY the plate number text, nothing else. "
+                          "If no plate is visible, return NONE.")},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}}
+            ]}]},
+            timeout=20
+        )
+        if resp.status_code != 200:
+            return None
+        text  = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip().upper()
+        if text in ("NONE", ""):
+            return None
+        text  = re.sub(r"[^A-Z0-9 ]", " ", text)
+        text  = re.sub(r"\s+", " ", text).strip()
+        clean = re.sub(r"[^A-Z0-9]", "", text)
+        if len(clean) >= 4 and re.search(r"[A-Z]", clean) and re.search(r"[0-9]", clean):
+            return text
     except Exception:
-        h,w=crop.shape[:2]; return cv2.resize(crop,(w*4,h*4),interpolation=cv2.INTER_CUBIC)
-
-def read_plate_text(crop, m):
-    import pytesseract
-    h,w=crop.shape[:2]
-    up = super_resolve(crop) if w < 150 else cv2.resize(crop,(w*3,h*3),interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-    gray = cv2.fastNlMeansDenoising(gray, h=10)
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4,4)); gray = clahe.apply(gray)
-    gray = cv2.filter2D(gray,-1,np.array([[0,-1,0],[-1,5,-1],[0,-1,0]]))
-    _,th1=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-    _,th2=cv2.threshold(gray,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
-    th3=cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,15,4)
-    cands=[]
-    try:
-        r=m['plate_ocr'].run(crop)
-        if r:
-            t=r[0].upper().strip(); cl=re.sub(r'[^A-Z0-9]','',t)
-            if len(cl)>=4 and re.search(r'[A-Z]',cl) and re.search(r'[0-9]',cl):
-                cands.append((len(cl),t))
-    except: pass
-    for img in [th1,th2,th3]:
-        hits=m['easyocr'].readtext(img,detail=1,paragraph=False,
-            allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-            text_threshold=0.2,low_text=0.1,width_ths=2.0,ycenter_ths=2.0)
-        hits=sorted(hits,key=lambda x:(sum(p[1] for p in x[0])/4,sum(p[0] for p in x[0])/4))
-        t=' '.join(t.strip().upper() for _,t,c in hits if len(t.strip())>=1)
-        t=re.sub(r'\s+',' ',t).strip(); cl=re.sub(r'[^A-Z0-9]','',t)
-        if len(cl)>=4 and re.search(r'[A-Z]',cl) and re.search(r'[0-9]',cl):
-            cands.append((len(cl),t))
-    for psm in [7,6,8]:
-        cfg=f'--oem 3 --psm {psm} -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        for img in [th1,th2]:
-            try:
-                t=pytesseract.image_to_string(img,config=cfg).strip().upper()
-                t=re.sub(r'[^A-Z0-9 ]',' ',t).strip(); t=re.sub(r'\s+',' ',t)
-                cl=re.sub(r'[^A-Z0-9]','',t)
-                if len(cl)>=4 and re.search(r'[A-Z]',cl) and re.search(r'[0-9]',cl):
-                    cands.append((len(cl),t))
-            except: pass
-    return sorted(cands,reverse=True)[0][1] if cands else None
+        pass
+    return None
 
 
+# ── Plate detection ───────────────────────────────────────────────────────────
 def find_plate(img, rf, m):
     """
+    1. ALPR + YOLO  → find plate bounding box → draw ellipse + save crop
+    2. Gemini        → read plate text from FULL image (most reliable)
     Returns (plate_text, plate_crop_bgr)
-    plate_crop_bgr is the raw crop of the detected plate region (for Excel report)
     """
-    H,W=img.shape[:2]; crops=[]
+    H, W  = img.shape[:2]
+    plate_crop = None
+
+    # ── Step 1: Locate plate bbox ──────────────────────────────────────────
+    candidates = []
     for p in m['alpr'].predict(img):
-        b=p.detection.bounding_box
-        x1,y1,x2,y2=int(b.x1),int(b.y1),int(b.x2),int(b.y2)
-        pad=8; px1,py1=max(0,x1-pad),max(0,y1-pad); px2,py2=min(W,x2+pad),min(H,y2+pad)
-        at=''.join(c for c,s in zip(p.ocr.text,p.ocr.confidence) if s>0.35).upper()
-        ac=re.sub(r'[^A-Z0-9]','',at)
-        if len(ac)>=4 and re.search(r'[A-Z]',ac) and re.search(r'[0-9]',ac):
-            cv2.ellipse(rf,((px1+px2)//2,(py1+py2)//2),
-                        ((px2-px1)//2+10,(py2-py1)//2+10),0,0,360,(0,200,255),3)
-            return at, img[py1:py2,px1:px2].copy()
-        crops.append(((x2-x1)*(y2-y1),img[py1:py2,px1:px2],(px1,py1,px2,py2),None))
+        b = p.detection.bounding_box
+        x1,y1,x2,y2 = int(b.x1),int(b.y1),int(b.x2),int(b.y2)
+        candidates.append(((x2-x1)*(y2-y1), x1,y1,x2,y2))
+
     if m['plate']:
-        for box in m['plate'].predict(img,conf=0.10,verbose=False)[0].boxes:
-            x1,y1,x2,y2=map(int,box.xyxy[0].tolist()); pad=8
-            px1,py1=max(0,x1-pad),max(0,y1-pad); px2,py2=min(W,x2+pad),min(H,y2+pad)
-            crops.append(((x2-x1)*(y2-y1),img[py1:py2,px1:px2],(px1,py1,px2,py2),None))
-    crops.sort(key=lambda x:x[0],reverse=True)
-    for area,crop,(px1,py1,px2,py2),_ in crops:
-        ot=read_plate_text(crop,m)
-        if ot:
-            cl=re.sub(r'[^A-Z0-9]','',ot)
-            if len(cl)>=4 and re.search(r'[A-Z]',cl) and re.search(r'[0-9]',cl):
-                cv2.ellipse(rf,((px1+px2)//2,(py1+py2)//2),
-                            ((px2-px1)//2+10,(py2-py1)//2+10),0,0,360,(0,200,255),3)
-                return ot, crop.copy()
-    # Tesseract fallback — no crop available
-    try:
-        import pytesseract
-        bot=img[H//2:H,0:W]; up=cv2.resize(bot,(W*2,H),interpolation=cv2.INTER_CUBIC)
-        gray=cv2.cvtColor(up,cv2.COLOR_BGR2GRAY)
-        clahe=cv2.createCLAHE(clipLimit=4.0,tileGridSize=(8,8)); gray=clahe.apply(gray)
-        _,th=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        cfg='--oem 3 --psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        data=pytesseract.image_to_data(th,config=cfg,output_type=pytesseract.Output.DICT)
-        words=[(data['text'][i].strip().upper(),int(data['conf'][i]),data['left'][i],data['top'][i])
-               for i in range(len(data['text'])) if data['text'][i].strip() and int(data['conf'][i])>30]
-        if words:
-            words.sort(key=lambda x:(x[3],x[2]))
-            lines,cur=[],[words[0]]
-            for w in words[1:]:
-                if abs(w[3]-cur[-1][3])<20: cur.append(w)
-                else: lines.append(cur); cur=[w]
-            lines.append(cur)
-            bt,bs='',0
-            for line in lines:
-                line.sort(key=lambda x:x[2]); t=' '.join(w[0] for w in line)
-                cl=re.sub(r'[^A-Z0-9]','',t)
-                if len(cl)>bs and re.search(r'[A-Z]',cl) and re.search(r'[0-9]',cl):
-                    bs=len(cl); bt=t
-            if bs>=4: return bt, None
-    except: pass
-    return 'NOT DETECTED', None
+        for box in m['plate'].predict(img, conf=0.10, verbose=False)[0].boxes:
+            x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
+            candidates.append(((x2-x1)*(y2-y1), x1,y1,x2,y2))
+
+    if candidates:
+        # Pick largest bbox — most likely the actual plate
+        candidates.sort(reverse=True)
+        _, x1,y1,x2,y2 = candidates[0]
+        pad = 8
+        px1,py1 = max(0,x1-pad), max(0,y1-pad)
+        px2,py2 = min(W,x2+pad), min(H,y2+pad)
+        plate_crop = img[py1:py2, px1:px2].copy()
+
+        # Draw ellipse on result frame
+        cv2.ellipse(rf,
+            ((px1+px2)//2, (py1+py2)//2),
+            ((px2-px1)//2+10, (py2-py1)//2+10),
+            0, 0, 360, (0,200,255), 3)
+
+    # ── Step 2: Gemini reads text from full image ──────────────────────────
+    text = gemini_ocr(img)
+    if text:
+        return text, plate_crop
+
+    return 'NOT DETECTED', plate_crop
 
 
+# ── Helmet detection ──────────────────────────────────────────────────────────
 def run_detection(frame, m, conf):
-    """
-    Returns: result_frame, counts, violations, plate_text, plate_crop
-    violations = list of {'bbox': [...]}
-    plate_crop = BGR numpy array of the plate region (or None)
-    """
-    H,W=frame.shape[:2]; result=frame.copy()
-    counts={'helmet':0,'no_helmet':0}; violations=[]; seen=set()
-    C_OK=(0,180,0); C_BAD=(0,0,210)
+    H,W   = frame.shape[:2]
+    result = frame.copy()
+    counts = {'helmet':0,'no_helmet':0}
+    violations = []
+    seen = set()
+    C_OK  = (0,180,0)
+    C_BAD = (0,0,210)
 
-    hboxes=[]
+    hboxes = []
     for box in m['helmet'].predict(frame,conf=conf,iou=0.45,verbose=False)[0].boxes:
-        cv=float(box.conf[0]); idx=int(box.cls[0])
-        status=classify(m['helmet'].names[idx],idx)
-        x1,y1,x2,y2=map(int,box.xyxy[0].tolist())
-        key=(int((x1+x2)/2)//20,int((y1+y2)/2)//20)
+        cv_val = float(box.conf[0]); idx = int(box.cls[0])
+        status = classify(m['helmet'].names[idx], idx)
+        x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
+        key = (int((x1+x2)/2)//20, int((y1+y2)/2)//20)
         if key in seen: continue
-        seen.add(key); hboxes.append({'status':status,'bbox':[x1,y1,x2,y2],'conf':cv})
+        seen.add(key)
+        hboxes.append({'status':status,'bbox':[x1,y1,x2,y2],'conf':cv_val})
 
-    pboxes=[]
+    pboxes = []
     for box in m['person'].predict(frame,conf=0.25,iou=0.45,classes=[0],verbose=False)[0].boxes:
-        x1,y1,x2,y2=map(int,box.xyxy[0].tolist()); pboxes.append([x1,y1,x2,y2])
+        x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
+        pboxes.append([x1,y1,x2,y2])
 
-    matched=set()
+    matched = set()
     for hb in hboxes:
-        x1,y1,x2,y2=hb['bbox']; status=hb['status']; counts[status]+=1
-        tag=f"HELMET ({hb['conf']:.0%})" if status=='helmet' else f"NO HELMET ({hb['conf']:.0%})"
+        x1,y1,x2,y2 = hb['bbox']; status = hb['status']; counts[status] += 1
+        tag = f"HELMET ({hb['conf']:.0%})" if status=='helmet' else f"NO HELMET ({hb['conf']:.0%})"
         draw_circle(result,x1,y1,x2,y2,tag,C_OK if status=='helmet' else C_BAD)
         if status=='no_helmet': violations.append({'bbox':[x1,y1,x2,y2]})
         for i,pb in enumerate(pboxes):
-            px1,py1,px2,py2=pb; upper=[px1,py1,px2,py1+int((py2-py1)*0.4)]
-            if iou([x1,y1,x2,y2],upper)>0.05: matched.add(i)
+            px1,py1,px2,py2 = pb
+            upper = [px1,py1,px2,py1+int((py2-py1)*0.4)]
+            if iou([x1,y1,x2,y2],upper) > 0.05: matched.add(i)
+
     for i,pb in enumerate(pboxes):
         if i in matched: continue
-        px1,py1,px2,py2=pb
-        if (px2-px1)*(py2-py1)<W*H*0.005: continue
-        counts['no_helmet']+=1
+        px1,py1,px2,py2 = pb
+        if (px2-px1)*(py2-py1) < W*H*0.005: continue
+        counts['no_helmet'] += 1
         draw_circle(result,px1,py1,px2,py2,'NO HELMET',C_BAD)
         violations.append({'bbox':[px1,py1,px2,py2]})
 
-    # Only run plate detection if there are violations
     if violations:
         plate_text, plate_crop = find_plate(frame, result, m)
     else:
-        plate_text, plate_crop = 'N/A — No violations', None
+        plate_text, plate_crop = 'N/A', None
 
     return result, counts, violations, plate_text, plate_crop
 
 
+# ── Excel report ──────────────────────────────────────────────────────────────
 def build_excel(image_name, counts, violations, plate_text, plate_crop):
-    """
-    Violation report — plate crop + OCR only. No full image.
-    """
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.drawing.image import Image as XLImage
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Violation Report"
+    wb = Workbook(); ws = wb.active; ws.title = "Violation Report"
 
     hdr_fill    = PatternFill("solid", fgColor="1A1D2E")
     red_fill    = PatternFill("solid", fgColor="FEF2F2")
@@ -280,189 +246,149 @@ def build_excel(image_name, counts, violations, plate_text, plate_crop):
     yellow_fill = PatternFill("solid", fgColor="FFFBEB")
     white_fill  = PatternFill("solid", fgColor="FFFFFF")
     sub_fill    = PatternFill("solid", fgColor="E5E9F0")
-    border      = Border(
-        left=Side(style='thin', color='E5E9F0'),
-        right=Side(style='thin', color='E5E9F0'),
-        top=Side(style='thin', color='E5E9F0'),
-        bottom=Side(style='thin', color='E5E9F0'),
+    border = Border(
+        left=Side(style='thin',color='E5E9F0'), right=Side(style='thin',color='E5E9F0'),
+        top=Side(style='thin',color='E5E9F0'),  bottom=Side(style='thin',color='E5E9F0'),
     )
 
-    def cell(ref, text, bold=False, color="1A1D2E", size=10,
-             fill=white_fill, align="left"):
+    def cell(ref, text, bold=False, color="1A1D2E", size=10, fill=white_fill, align="left"):
         ws[ref] = text
         ws[ref].font      = Font(name="Arial", bold=bold, color=color, size=size)
         ws[ref].fill      = fill
         ws[ref].border    = border
         ws[ref].alignment = Alignment(horizontal=align, vertical="center", wrap_text=True)
 
-    # ── Title ──────────────────────────────────────────────────────────────
     ws.merge_cells("A1:F1")
-    cell("A1", "HELMET VIOLATION DETECTION REPORT",
-         bold=True, color="FFFFFF", size=14, fill=hdr_fill, align="center")
+    cell("A1","HELMET VIOLATION DETECTION REPORT",bold=True,color="FFFFFF",size=14,fill=hdr_fill,align="center")
     ws.row_dimensions[1].height = 36
 
     ws.merge_cells("A2:F2")
     ts = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
-    cell("A2", f"Image: {image_name}   |   Generated: {ts}",
-         color="64748B", size=9, fill=PatternFill("solid", fgColor="F8F9FC"), align="center")
+    cell("A2",f"Image: {image_name}   |   Generated: {ts}",
+         color="64748B",size=9,fill=PatternFill("solid",fgColor="F8F9FC"),align="center")
     ws.row_dimensions[2].height = 18
 
-    # ── Summary ────────────────────────────────────────────────────────────
     ws.merge_cells("A4:F4")
-    cell("A4", "DETECTION SUMMARY", bold=True, color="1A1D2E",
-         size=10, fill=sub_fill)
+    cell("A4","DETECTION SUMMARY",bold=True,size=10,fill=sub_fill)
     ws.row_dimensions[4].height = 22
 
-    for c, t in [("A5","Metric"),("B5","Value"),("C5","Status")]:
-        cell(c, t, bold=True, color="FFFFFF", fill=hdr_fill, align="center")
+    for c,t in [("A5","Metric"),("B5","Value"),("C5","Status")]:
+        cell(c,t,bold=True,color="FFFFFF",fill=hdr_fill,align="center")
     ws.row_dimensions[5].height = 20
 
     total = counts['helmet'] + counts['no_helmet']
-    data  = [
-        ("Total Riders", str(total),            "—",         white_fill, "1A1D2E"),
-        ("With Helmet",  str(counts['helmet']),  "COMPLIANT", green_fill, "166534"),
-        ("No Helmet",    str(counts['no_helmet']),"VIOLATION", red_fill,   "991B1B"),
-    ]
-    for i, (lbl, val, status, fill, scol) in enumerate(data, start=6):
+    for i,(lbl,val,status,fill,scol) in enumerate([
+        ("Total Riders",str(total),"—",white_fill,"1A1D2E"),
+        ("With Helmet",str(counts['helmet']),"COMPLIANT",green_fill,"166534"),
+        ("No Helmet",str(counts['no_helmet']),"VIOLATION",red_fill,"991B1B"),
+    ], start=6):
         ws.row_dimensions[i].height = 20
-        cell(f"A{i}", lbl,    fill=fill)
-        cell(f"B{i}", val,    bold=True, fill=fill, align="center")
-        cell(f"C{i}", status, bold=True, color=scol, fill=fill, align="center")
+        cell(f"A{i}",lbl,fill=fill)
+        cell(f"B{i}",val,bold=True,fill=fill,align="center")
+        cell(f"C{i}",status,bold=True,color=scol,fill=fill,align="center")
 
-    # ── Violation table ────────────────────────────────────────────────────
     ws.merge_cells("A9:F9")
-    cell("A9", "VIOLATION DETAILS  (No Helmet Riders Only)",
-         bold=True, color="991B1B", size=10,
-         fill=PatternFill("solid", fgColor="FEF2F2"))
+    cell("A9","VIOLATION DETAILS  (No Helmet Riders Only)",
+         bold=True,color="991B1B",size=10,fill=PatternFill("solid",fgColor="FEF2F2"))
     ws.row_dimensions[9].height = 22
 
-    for c, t in [("A10","Rider #"),("B10","Violation"),
-                  ("C10","Number Plate"),("D10","Bounding Box")]:
-        cell(c, t, bold=True, color="FFFFFF", fill=hdr_fill, align="center")
+    for c,t in [("A10","Rider #"),("B10","Violation"),("C10","Number Plate"),("D10","Bounding Box")]:
+        cell(c,t,bold=True,color="FFFFFF",fill=hdr_fill,align="center")
     ws.row_dimensions[10].height = 20
 
     if violations:
-        for i, v in enumerate(violations, start=1):
-            r = 10 + i
-            ws.row_dimensions[r].height = 20
+        for i,v in enumerate(violations,start=1):
+            r = 10+i; ws.row_dimensions[r].height = 20
             bbox = f"x1={v['bbox'][0]} y1={v['bbox'][1]} x2={v['bbox'][2]} y2={v['bbox'][3]}"
-            plate_val = plate_text if plate_text not in (
-                'NOT DETECTED','N/A — No violations') else "—"
-            cell(f"A{r}", i,          bold=True, fill=red_fill, align="center")
-            cell(f"B{r}", "No Helmet",bold=True, color="991B1B", fill=red_fill)
-            cell(f"C{r}", plate_val,  bold=True, color="92400E",
-                 fill=yellow_fill, align="center")
-            cell(f"D{r}", bbox, fill=red_fill)
+            pval = plate_text if plate_text not in ('NOT DETECTED','N/A') else "—"
+            cell(f"A{r}",i,bold=True,fill=red_fill,align="center")
+            cell(f"B{r}","No Helmet",bold=True,color="991B1B",fill=red_fill)
+            cell(f"C{r}",pval,bold=True,color="92400E",fill=yellow_fill,align="center")
+            cell(f"D{r}",bbox,fill=red_fill)
     else:
         ws.merge_cells("A11:D11")
-        cell("A11", "No violations detected.", color="166534",
-             fill=green_fill, align="center")
+        cell("A11","No violations detected.",color="166534",fill=green_fill,align="center")
         ws.row_dimensions[11].height = 20
 
-    # ── Plate crop + OCR (violations only, no full image) ─────────────────
-    plate_row = 10 + max(len(violations), 1) + 3
+    plate_row = 10 + max(len(violations),1) + 3
 
     if violations and plate_crop is not None:
         ws.merge_cells(f"A{plate_row}:F{plate_row}")
-        cell(f"A{plate_row}", "NUMBER PLATE IMAGE  (Violation Evidence)",
-             bold=True, color="92400E", size=10, fill=yellow_fill)
+        cell(f"A{plate_row}","NUMBER PLATE  (Violation Evidence)",
+             bold=True,color="92400E",size=10,fill=yellow_fill)
         ws.row_dimensions[plate_row].height = 22
 
-        ocr_row = plate_row + 1
+        ocr_row = plate_row+1
         ws.merge_cells(f"A{ocr_row}:F{ocr_row}")
-        cell(f"A{ocr_row}", f"OCR Read:   {plate_text}",
-             bold=True, color="92400E", size=14, fill=yellow_fill, align="center")
+        cell(f"A{ocr_row}",f"OCR Read:   {plate_text}",
+             bold=True,color="92400E",size=14,fill=yellow_fill,align="center")
         ws.row_dimensions[ocr_row].height = 32
 
-        # Embed plate crop image
-        img_row = ocr_row + 1
+        img_row = ocr_row+1
         pil = Image.fromarray(cv2.cvtColor(plate_crop, cv2.COLOR_BGR2RGB))
-        # Upscale for readability — min 400px wide
         if pil.width < 400:
-            scale = 400 / pil.width
-            pil = pil.resize(
-                (int(pil.width * scale), int(pil.height * scale)),
-                Image.LANCZOS
-            )
-        buf_img = io.BytesIO()
-        pil.save(buf_img, format='PNG')
-        buf_img.seek(0)
-        xl = XLImage(buf_img)
-        xl.anchor = f"A{img_row}"
-        ws.add_image(xl)
-        for r in range(img_row, img_row + 25):
-            ws.row_dimensions[r].height = 15
+            scale = 400/pil.width
+            pil = pil.resize((int(pil.width*scale),int(pil.height*scale)),Image.LANCZOS)
+        buf_img = io.BytesIO(); pil.save(buf_img,format='PNG'); buf_img.seek(0)
+        xl = XLImage(buf_img); xl.anchor = f"A{img_row}"; ws.add_image(xl)
+        for r in range(img_row, img_row+25): ws.row_dimensions[r].height = 15
 
     elif violations:
-        # Plate detected via Tesseract fallback (no crop image available)
         ws.merge_cells(f"A{plate_row}:F{plate_row}")
-        cell(f"A{plate_row}",
-             f"Number Plate (OCR):   {plate_text}",
-             bold=True, color="92400E", size=13,
-             fill=yellow_fill, align="center")
+        cell(f"A{plate_row}",f"Number Plate (OCR):   {plate_text}",
+             bold=True,color="92400E",size=13,fill=yellow_fill,align="center")
         ws.row_dimensions[plate_row].height = 32
 
-    # ── Column widths ──────────────────────────────────────────────────────
-    for col, w in [('A',10),('B',18),('C',20),('D',32),('E',12),('F',12)]:
+    for col,w in [('A',10),('B',18),('C',20),('D',32),('E',12),('F',12)]:
         ws.column_dimensions[col].width = w
 
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
+    out = io.BytesIO(); wb.save(out); out.seek(0)
     return out
 
 
-
-
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🪖 Helmet Detector")
     st.divider()
-
     st.markdown("**Model Status**")
-    h_ok = HELMET_MODEL_PATH.exists()
-    p_ok = PLATE_MODEL_PATH.exists()
-    st.success("helmet_best.pt  ✓" if h_ok else "helmet_best.pt  ✗", icon="🟢" if h_ok else "🔴")
-    st.info("plate_best.pt  ✓" if p_ok else "plate_best.pt  ─ ALPR fallback", icon="🟢" if p_ok else "🟡")
-    st.success("ALPR  cct-s-v2-global  ✓", icon="🟢")
-    st.success("EasyOCR  ✓", icon="🟢")
-
+    st.success("helmet_best.pt ✓" if HELMET_MODEL_PATH.exists() else "helmet_best.pt ✗",
+               icon="🟢" if HELMET_MODEL_PATH.exists() else "🔴")
+    st.info("plate_best.pt ✓" if PLATE_MODEL_PATH.exists() else "plate_best.pt — ALPR fallback",
+            icon="🟢" if PLATE_MODEL_PATH.exists() else "🟡")
+    st.success("ALPR · Plate OCR ✓", icon="🟢")
     st.divider()
     st.markdown("**Settings**")
-    conf_threshold = st.slider(
-        "Detection confidence", 0.20, 0.80, 0.45, 0.05,
-        help="Raise to reduce false positives"
-    )
+    conf_threshold = st.slider("Confidence", 0.20, 0.80, 0.45, 0.05,
+                                help="Raise to reduce false positives")
     st.divider()
-    st.markdown("**Quick guide**")
-    st.markdown("1. Upload a traffic image\n2. Click **Run Detection**\n3. Download image or Excel report")
+    st.markdown("**Steps**")
+    st.markdown("1. Upload image\n2. Click **Run Detection**\n3. Download results")
     st.divider()
-    st.caption("YOLOv8 · ALPR · EasyOCR · Tesseract")
+    st.caption("YOLOv8 · ALPR · Computer Vision")
 
 
-# ── Header ─────────────────────────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("## 🪖 Helmet Violation Detection")
-st.caption("Upload a motorcycle / traffic image to detect helmet violations and read number plates.")
+st.caption("Detect helmet violations and read number plates from motorcycle traffic images.")
 st.divider()
 
 if not HELMET_MODEL_PATH.exists():
     st.error(
         "**Helmet model not found.** Place `helmet_best.pt` in the `models/` folder.\n\n"
-        "Download from Colab:\n```python\nfrom google.colab import files\n"
+        "Download from Colab after training:\n"
+        "```python\nfrom google.colab import files\n"
         "files.download('/content/runs/detect/helmet_v1/weights/best.pt')\n```"
     )
     st.stop()
 
-# ── Layout ─────────────────────────────────────────────────────────────────────
+
+# ── Layout ────────────────────────────────────────────────────────────────────
 col_l, col_r = st.columns([1, 1], gap="large")
 
 with col_l:
     st.markdown('<p class="sec-label">Input Image</p>', unsafe_allow_html=True)
-    uploaded = st.file_uploader(
-        "Upload image",
-        type=["jpg", "jpeg", "png", "webp"],
-        label_visibility="collapsed"
-    )
+    uploaded = st.file_uploader("Upload image", type=["jpg","jpeg","png","webp"],
+                                  label_visibility="collapsed")
     if uploaded:
         img_pil = Image.open(uploaded).convert("RGB")
         st.image(img_pil, use_container_width=True)
@@ -485,11 +411,11 @@ with col_r:
             models = load_models()
 
         if not models:
-            st.error("Failed to load models.")
+            st.error("Failed to load models. Check that `helmet_best.pt` exists in `models/`.")
         else:
             frame = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-            with st.spinner("Running detection…"):
+            with st.spinner("Detecting helmets…"):
                 result_frame, counts, violations, plate_text, plate_crop = run_detection(
                     frame, models, conf_threshold
                 )
@@ -497,29 +423,26 @@ with col_r:
             result_rgb = cv2.cvtColor(result_frame, cv2.COLOR_BGR2RGB)
             st.image(result_rgb, use_container_width=True)
 
-            # ── Stats ──────────────────────────────────────────────────────
+            # Stats
             total = counts['helmet'] + counts['no_helmet']
             st.markdown(f"""
 <div class="sc">
   <div class="sc-item sc-blue">
-    <div class="sc-num">{total}</div>
-    <div class="sc-lbl">Riders</div>
+    <div class="sc-num">{total}</div><div class="sc-lbl">Riders</div>
   </div>
   <div class="sc-item sc-green">
-    <div class="sc-num">{counts['helmet']}</div>
-    <div class="sc-lbl">With Helmet</div>
+    <div class="sc-num">{counts['helmet']}</div><div class="sc-lbl">With Helmet</div>
   </div>
   <div class="sc-item sc-red">
-    <div class="sc-num">{counts['no_helmet']}</div>
-    <div class="sc-lbl">No Helmet</div>
+    <div class="sc-num">{counts['no_helmet']}</div><div class="sc-lbl">No Helmet</div>
   </div>
 </div>""", unsafe_allow_html=True)
 
-            # ── Plate + violations ─────────────────────────────────────────
+            # Plate + violations
             if violations:
                 st.markdown('<p class="sec-label">Number Plate — Violation Rider</p>',
                               unsafe_allow_html=True)
-                if plate_text and plate_text not in ('NOT DETECTED', 'N/A — No violations'):
+                if plate_text and plate_text not in ('NOT DETECTED','N/A'):
                     st.markdown(f'<div class="plate-ok">{plate_text}</div>',
                                   unsafe_allow_html=True)
                 else:
@@ -537,67 +460,41 @@ with col_r:
 
             st.markdown("")
 
-            # ── Downloads ──────────────────────────────────────────────────
+            # Downloads
             d1, d2, d3 = st.columns(3)
 
             img_buf = io.BytesIO()
             Image.fromarray(result_rgb).save(img_buf, format="JPEG", quality=93)
-
             with d1:
-                st.download_button(
-                    "⬇  Annotated Image",
-                    data=img_buf.getvalue(),
-                    file_name="detection_result.jpg",
-                    mime="image/jpeg",
-                    use_container_width=True,
-                )
+                st.download_button("⬇ Annotated Image", data=img_buf.getvalue(),
+                                    file_name="detection_result.jpg", mime="image/jpeg",
+                                    use_container_width=True)
 
-            # Plate image download — only for violations
             with d2:
                 if violations and plate_crop is not None:
-                    pil_plate = Image.fromarray(
-                        cv2.cvtColor(plate_crop, cv2.COLOR_BGR2RGB))
+                    pil_plate = Image.fromarray(cv2.cvtColor(plate_crop, cv2.COLOR_BGR2RGB))
                     if pil_plate.width < 400:
-                        scale = 400 / pil_plate.width
+                        scale = 400/pil_plate.width
                         pil_plate = pil_plate.resize(
-                            (int(pil_plate.width*scale),
-                             int(pil_plate.height*scale)),
+                            (int(pil_plate.width*scale), int(pil_plate.height*scale)),
                             Image.LANCZOS)
                     plate_buf = io.BytesIO()
                     pil_plate.save(plate_buf, format="PNG")
-                    st.download_button(
-                        "🔍  Number Plate Image",
-                        data=plate_buf.getvalue(),
-                        file_name="number_plate.png",
-                        mime="image/png",
-                        use_container_width=True,
-                    )
+                    st.download_button("🔍 Plate Image", data=plate_buf.getvalue(),
+                                        file_name="number_plate.png", mime="image/png",
+                                        use_container_width=True)
                 else:
-                    st.button("🔍  No Plate Found",
-                              disabled=True,
-                              use_container_width=True)
+                    st.button("🔍 No Plate Found", disabled=True, use_container_width=True)
 
             with d3:
                 with st.spinner("Building report…"):
-                    xlsx_buf = build_excel(
-                        uploaded.name, counts,
-                        violations, plate_text, plate_crop
-                    )
+                    xlsx_buf = build_excel(uploaded.name, counts,
+                                            violations, plate_text, plate_crop)
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                st.download_button(
-                    "📊  Excel Report",
-                    data=xlsx_buf.getvalue(),
-                    file_name=f"violation_report_{ts}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-
-            if violations:
-                st.info(
-                    "**Excel report contains:** Detection summary · "
-                    "Violation table · Annotated image · Number plate crop with OCR text",
-                    icon="📊"
-                )
+                st.download_button("📊 Excel Report", data=xlsx_buf.getvalue(),
+                                    file_name=f"violation_report_{ts}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    use_container_width=True)
 
     else:
         st.markdown("""
